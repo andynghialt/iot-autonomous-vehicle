@@ -24,23 +24,24 @@ unsigned long lastTime = 0;
 int16_t gz_offset = 0;
 String latestMapLog = "Hệ thống sẵn sàng...";
 
-// Trạng thái điều khiển góc tự động
+// Biến lưu thông số nhận từ Worker để đẩy lên Web real-time
+String workerEncoderData = "X: 0 | Y: 0";
+
 enum RobotState { IDLE, TURNING };
 RobotState robotState = IDLE;
 
-// Giao diện Web có thêm nút Quay 180 độ
 const char MAIN_page[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Điều Khiển Robot Kho Hàng</title>
+  <title>Điều Khiển Robot Kho Hàng & Real-time Dashboard</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; margin: 10px; background: #f0f2f5; }
-    h1 { color: #333; font-size: 18px; }
+    h1 { color: #333; font-size: 17px; margin-bottom: 8px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 320px; margin: 0 auto; }
-    button { padding: 14px; font-size: 14px; cursor: pointer; border-radius: 8px; border: none; color: white; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    button { padding: 12px; font-size: 14px; cursor: pointer; border-radius: 8px; border: none; color: white; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
     .btn-forward { background-color: #2e7d32; grid-column: span 2; }
     .btn-left { background-color: #1565c0; }
     .btn-right { background-color: #ef6c00; }
@@ -51,12 +52,19 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     .btn-stop { background-color: #c2185b; }
     .full-w { grid-column: span 2; }
     button:active { transform: scale(0.96); }
-    .status { margin-top: 12px; font-size: 15px; color: #111; font-weight: bold; }
-    .log-box { margin-top: 10px; background: #000; color: #0f0; padding: 8px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 11px; height: 75px; overflow-y: auto; max-width: 320px; margin-left: auto; margin-right: auto; }
+    
+    .panel { background: #fff; padding: 10px; border-radius: 8px; max-width: 320px; margin: 10px auto; box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: left; font-size: 13px; }
+    .panel label { font-weight: bold; color: #444; display: block; margin-bottom: 4px; }
+    .panel input { width: 70px; padding: 4px; font-size: 13px; }
+    .panel button { padding: 6px 12px; font-size: 12px; background: #3f51b5; margin-top: 5px; }
+    
+    .status { margin-top: 8px; font-size: 14px; color: #111; font-weight: bold; }
+    .log-box { margin-top: 8px; background: #000; color: #0f0; padding: 8px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 11px; height: 65px; overflow-y: auto; max-width: 320px; margin-left: auto; margin-right: auto; }
+    .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 12px; font-weight: bold; max-width: 320px; margin-left: auto; margin-right: auto; }
   </style>
 </head>
 <body>
-  <h1>ĐIỀU KHIỂN ROBOT CHUẨN IMU</h1>
+  <h1>ĐIỀU KHIỂN & TELEMETRY ROBOT</h1>
   
   <div class="grid">
     <button class="btn-forward" onclick="sendCmd('FORWARD')">TIẾN</button>
@@ -69,6 +77,15 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     <button class="btn-stop full-w" onclick="sendCmd('STOP')">STOP (DỪNG)</button>
   </div>
 
+  <div class="panel">
+    <label>Cài đặt Scale Encoder:</label>
+    Trái (X): <input type="number" id="sX" step="0.05" value="1.0"> 
+    Phải (Y): <input type="number" id="sY" step="0.05" value="1.0">
+    <br>
+    <button onclick="updateScale()">Cập nhật Scale</button>
+  </div>
+
+  <div class="telemetry" id="telemetryBox">IMU Yaw: 0.0° | Encoder: X:0 Y:0</div>
   <div class="status" id="st">Trạng thái: ĐANG DỪNG</div>
   <div class="log-box" id="logBox">Đang kết nối...</div>
 
@@ -78,11 +95,23 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         .then(res => res.text())
         .then(val => { document.getElementById("st").innerText = "Lệnh: " + val; });
     }
-    setInterval(function() {
-      fetch('/getlog')
+
+    function updateScale() {
+      let sx = document.getElementById("sX").value;
+      let sy = document.getElementById("sY").value;
+      fetch('/scale?sx=' + sx + '&sy=' + sy)
         .then(res => res.text())
-        .then(data => { if(data.trim() !== "") document.getElementById("logBox").innerText = data; });
-    }, 1000);
+        .then(val => { alert("Đã cập nhật Scale thành công!"); });
+    }
+
+    setInterval(function() {
+      fetch('/getdata')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById("telemetryBox").innerText = "Yaw: " + data.yaw + "° | " + data.enc;
+          if(data.log) document.getElementById("logBox").innerText = data.log;
+        });
+    }, 500);
   </script>
 </body>
 </html>
@@ -98,32 +127,32 @@ void handleCmd() {
     currentCommand = action;
 
     if (action == "FORWARD") {
-      Serial2.write('F');
+      Serial2.println("CMD:F");
       robotState = IDLE;
     } else if (action == "BACKWARD") {
-      Serial2.write('B');
+      Serial2.println("CMD:B");
       robotState = IDLE;
     } else if (action == "TURN_LEFT_90") {
-      targetYaw = yawAngle + 90.0; // Mốc góc mục tiêu quay trái
-      Serial2.write('L');
+      targetYaw = yawAngle + 90.0;
+      Serial2.println("CMD:L");
       robotState = TURNING;
     } else if (action == "TURN_RIGHT_90") {
-      targetYaw = yawAngle - 90.0; // Mốc góc mục tiêu quay phải
-      Serial2.write('R');
+      targetYaw = yawAngle - 90.0;
+      Serial2.println("CMD:R");
       robotState = TURNING;
     } else if (action == "TURN_LEFT_180") {
       targetYaw = yawAngle + 180.0;
-      Serial2.write('L');
+      Serial2.println("CMD:L");
       robotState = TURNING;
     } else if (action == "TURN_RIGHT_180") {
       targetYaw = yawAngle - 180.0;
-      Serial2.write('R');
+      Serial2.println("CMD:R");
       robotState = TURNING;
     } else if (action == "STOP") {
-      Serial2.write('S');
+      Serial2.println("CMD:S");
       robotState = IDLE;
     } else if (action == "GO") {
-      Serial2.write('G');
+      Serial2.println("CMD:G");
       robotState = IDLE;
     }
 
@@ -133,8 +162,24 @@ void handleCmd() {
   }
 }
 
-void handleGetLog() {
-  server.send(200, "text/plain; charset=utf-8", latestMapLog);
+void handleScale() {
+  if (server.hasArg("sx") && server.hasArg("sy")) {
+    String sx = server.arg("sx");
+    String sy = server.arg("sy");
+    Serial2.println("SCALE:" + sx + "," + sy);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Bad Scale");
+  }
+}
+
+void handleGetData() {
+  String json = "{";
+  json += "\"yaw\":" + String(yawAngle, 1) + ",";
+  json += "\"enc\":\"" + workerEncoderData + "\",";
+  json += "\"log\":\"" + latestMapLog + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 void setup() {
@@ -151,21 +196,22 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Hiệu chuẩn IMU ban đầu lấy điểm tham chiếu (Yaw = 0)
+  // Lấy 500 mẫu để khử triệt để sai số trôi tĩnh (drift) của Gyro ban đầu
   long sum = 0;
-  for(int i = 0; i < 200; i++) {
+  for(int i = 0; i < 500; i++) {
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
     sum += gz;
-    delay(3);
+    delay(2);
   }
-  gz_offset = sum / 200;
-  yawAngle = 0.0; // Thiết lập mốc tham chiếu ban đầu
+  gz_offset = sum / 500;
+  yawAngle = 0.0;
 
   WiFi.softAP(ssid, password);
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
-  server.on("/getlog", handleGetLog);
+  server.on("/scale", handleScale);
+  server.on("/getdata", handleGetData);
   server.begin();
 
   lastTime = millis();
@@ -174,7 +220,6 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Đọc dữ liệu IMU liên tục
   int16_t ax, ay, az, gx, gy, gz;
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
   
@@ -183,22 +228,22 @@ void loop() {
   lastTime = now;
 
   float gz_deg = (gz - gz_offset) / 131.0;
-  if (abs(gz_deg) > 0.5) { // Lọc nhiễu tĩnh
+  if (abs(gz_deg) > 0.8) { // Tăng ngưỡng lọc lên 0.8 độ/s để chống trôi khi xe đứng yên
     yawAngle += gz_deg * dt;
   }
 
-  // Vòng lặp giám sát góc quay vòng kín (Closed-Loop Turning)
+  // Vòng lặp giám sát góc quay vòng kín (Closed-Loop Turning) chuẩn IMU
   if (robotState == TURNING) {
     if (currentCommand.indexOf("LEFT") != -1) {
       if (yawAngle >= targetYaw) {
-        Serial2.write('S'); // Đạt góc mục tiêu -> Gửi lệnh dừng ngay lập tức
+        Serial2.println("CMD:S");
         robotState = IDLE;
         currentCommand = "STOP";
         latestMapLog = "Đã quay xong đúng góc!";
       }
     } else if (currentCommand.indexOf("RIGHT") != -1) {
       if (yawAngle <= targetYaw) {
-        Serial2.write('S'); // Đạt góc mục tiêu -> Gửi lệnh dừng ngay lập tức
+        Serial2.println("CMD:S");
         robotState = IDLE;
         currentCommand = "STOP";
         latestMapLog = "Đã quay xong đúng góc!";
@@ -211,15 +256,16 @@ void loop() {
     incoming.trim();
     if (incoming.startsWith("LOG:")) {
       latestMapLog = incoming.substring(4);
+    } else if (incoming.startsWith("ENC:")) {
+      workerEncoderData = incoming.substring(4);
     }
   }
 
-  // Hiển thị đầy đủ thông tin IMU lên LCD 0.98 inch để kiểm tra trực tiếp
   display.clearDisplay();
   display.setCursor(0, 0);
   display.print("Cmd: "); display.println(currentCommand);
   display.print("Yaw: "); display.print(yawAngle, 1); display.println(" deg");
-  display.print("Target: "); display.print(targetYaw, 1); display.println(" deg");
+  display.print(workerEncoderData);
   display.display();
   
   delay(15);
