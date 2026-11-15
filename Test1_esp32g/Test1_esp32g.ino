@@ -1,3 +1,19 @@
+/* =====================================================================
+ * PROJECT: Maze & Warehouse Differential-Drive Robot (ESP32 Master-Gateway)
+ * FILE: ESP32_Master_Gateway.ino
+ * VERSION: v1.2.8
+ * DATE: 2026-11-14
+ * 
+ * COMPATIBILITY MATRIX:
+ * - Master v1.2.8 <--> Bắt buộc đi kèm Worker v1.2.7
+ * 
+ * CHANGES IN v1.2.8 (SO VỚI v1.2.7):
+ * - Sửa lại logic cập nhật Locked Heading: Chỉ cập nhật khi xe thực hiện xong 
+ *   các lệnh quay góc (Trái/Phải 90°/180°), cộng/trừ dồn chuẩn xác theo tọa độ mê cung.
+ * - Khi Tiến/Lùi, xe giữ nguyên Locked Heading hiện tại làm mốc bám thẳng tuyệt đối.
+ * - Bổ sung truyền tải thông số sai số bù hướng (`Correction`) để hiển thị lên OLED và Web.
+ * ===================================================================== */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Wire.h>
@@ -20,14 +36,14 @@ WebServer server(80);
 String currentCommand = "STOP";
 float yawAngle = 0;
 float targetYaw = 0;
+float lockedHeading = 0; // Góc gốc chuẩn của mê cung (0, 90, 180, 270...)
+int lastCorrectionVal = 0; // Lưu sai số bù hướng để đẩy lên Web/OLED
 unsigned long lastTime = 0;
 int16_t gz_offset = 0;
 String latestMapLog = "Hệ thống sẵn sàng...";
-
-// Biến lưu thông số nhận từ Worker để đẩy lên Web real-time
 String workerEncoderData = "X: 0 | Y: 0";
 
-enum RobotState { IDLE, TURNING };
+enum RobotState { IDLE, STRAIGHT, TURNING, ALIGN_BEFORE_STOP };
 RobotState robotState = IDLE;
 
 const char MAIN_page[] PROGMEM = R"rawliteral(
@@ -36,7 +52,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Điều Khiển Robot Kho Hàng & Real-time Dashboard</title>
+  <title>Maze Robot - v1.2.8 Telemetry</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; margin: 10px; background: #f0f2f5; }
     h1 { color: #333; font-size: 17px; margin-bottom: 8px; }
@@ -59,12 +75,12 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     .panel button { padding: 6px 12px; font-size: 12px; background: #3f51b5; margin-top: 5px; }
     
     .status { margin-top: 8px; font-size: 14px; color: #111; font-weight: bold; }
-    .log-box { margin-top: 8px; background: #000; color: #0f0; padding: 8px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 11px; height: 65px; overflow-y: auto; max-width: 320px; margin-left: auto; margin-right: auto; }
-    .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 12px; font-weight: bold; max-width: 320px; margin-left: auto; margin-right: auto; }
+    .log-box { margin-top: 8px; background: #000; color: #0f0; padding: 8px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 11px; height: 55px; overflow-y: auto; max-width: 320px; margin-left: auto; margin-right: auto; }
+    .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 11px; font-weight: bold; max-width: 320px; margin-left: auto; margin-right: auto; line-height: 1.4; }
   </style>
 </head>
 <body>
-  <h1>ĐIỀU KHIỂN & TELEMETRY ROBOT</h1>
+  <h1>MAZE ROBOT v1.2.8</h1>
   
   <div class="grid">
     <button class="btn-forward" onclick="sendCmd('FORWARD')">TIẾN</button>
@@ -74,7 +90,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     <button class="btn-right180" onclick="sendCmd('TURN_RIGHT_180')">QUAY PHẢI 180°</button>
     <button class="btn-backward" onclick="sendCmd('BACKWARD')">LÙI</button>
     <button class="btn-go full-w" onclick="sendCmd('GO')">ĐI (GO)</button>
-    <button class="btn-stop full-w" onclick="sendCmd('STOP')">STOP (DỪNG)</button>
+    <button class="btn-stop full-w" onclick="sendCmd('STOP')">STOP (DỪNG & CĂN CHỈNH)</button>
   </div>
 
   <div class="panel">
@@ -85,7 +101,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     <button onclick="updateScale()">Cập nhật Scale</button>
   </div>
 
-  <div class="telemetry" id="telemetryBox">IMU Yaw: 0.0° | Encoder: X:0 Y:0</div>
+  <div class="telemetry" id="telemetryBox">Yaw: 0.0° | Locked: 0.0°<br>Sai số bù (Corr): 0 | X:0 Y:0</div>
   <div class="status" id="st">Trạng thái: ĐANG DỪNG</div>
   <div class="log-box" id="logBox">Đang kết nối...</div>
 
@@ -108,10 +124,11 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       fetch('/getdata')
         .then(res => res.json())
         .then(data => {
-          document.getElementById("telemetryBox").innerText = "Yaw: " + data.yaw + "° | " + data.enc;
+          document.getElementById("telemetryBox").innerHTML = 
+            "Yaw: " + data.yaw + "° | Locked: " + data.locked + "°<br>Sai số bù (Corr): " + data.corr + " | " + data.enc;
           if(data.log) document.getElementById("logBox").innerText = data.log;
         });
-    }, 500);
+    }, 400);
   </script>
 </body>
 </html>
@@ -128,32 +145,27 @@ void handleCmd() {
 
     if (action == "FORWARD") {
       Serial2.println("CMD:F");
-      robotState = IDLE;
+      robotState = STRAIGHT;
     } else if (action == "BACKWARD") {
       Serial2.println("CMD:B");
-      robotState = IDLE;
+      robotState = STRAIGHT;
     } else if (action == "TURN_LEFT_90") {
-      targetYaw = yawAngle + 90.0;
-      Serial2.println("CMD:L");
+      targetYaw = lockedHeading + 90.0; // Cộng dồn chuẩn xác vào góc gốc hiện tại
       robotState = TURNING;
     } else if (action == "TURN_RIGHT_90") {
-      targetYaw = yawAngle - 90.0;
-      Serial2.println("CMD:R");
+      targetYaw = lockedHeading - 90.0; // Trừ dồn chuẩn xác vào góc gốc hiện tại
       robotState = TURNING;
     } else if (action == "TURN_LEFT_180") {
-      targetYaw = yawAngle + 180.0;
-      Serial2.println("CMD:L");
+      targetYaw = lockedHeading + 180.0;
       robotState = TURNING;
     } else if (action == "TURN_RIGHT_180") {
-      targetYaw = yawAngle - 180.0;
-      Serial2.println("CMD:R");
+      targetYaw = lockedHeading - 180.0; // Lưu ý: Quay phải 180 cũng chuẩn hóa trừ dồn
       robotState = TURNING;
     } else if (action == "STOP") {
-      Serial2.println("CMD:S");
-      robotState = IDLE;
+      robotState = ALIGN_BEFORE_STOP;
+      latestMapLog = "Đang hiệu chỉnh góc về hướng gốc trước khi dừng...";
     } else if (action == "GO") {
-      Serial2.println("CMD:G");
-      robotState = IDLE;
+      robotState = STRAIGHT;
     }
 
     server.send(200, "text/plain; charset=utf-8", currentCommand);
@@ -176,6 +188,8 @@ void handleScale() {
 void handleGetData() {
   String json = "{";
   json += "\"yaw\":" + String(yawAngle, 1) + ",";
+  json += "\"locked\":" + String(lockedHeading, 1) + ",";
+  json += "\"corr\":" + String(lastCorrectionVal) + ",";
   json += "\"enc\":\"" + workerEncoderData + "\",";
   json += "\"log\":\"" + latestMapLog + "\"";
   json += "}";
@@ -196,7 +210,6 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Lấy 500 mẫu để khử triệt để sai số trôi tĩnh (drift) của Gyro ban đầu
   long sum = 0;
   for(int i = 0; i < 500; i++) {
     int16_t ax, ay, az, gx, gy, gz;
@@ -206,6 +219,7 @@ void setup() {
   }
   gz_offset = sum / 500;
   yawAngle = 0.0;
+  lockedHeading = 0.0; // Khởi tạo góc gốc ban đầu là 0.0 độ
 
   WiFi.softAP(ssid, password);
   server.on("/", handleRoot);
@@ -228,25 +242,52 @@ void loop() {
   lastTime = now;
 
   float gz_deg = (gz - gz_offset) / 131.0;
-  if (abs(gz_deg) > 0.8) { // Tăng ngưỡng lọc lên 0.8 độ/s để chống trôi khi xe đứng yên
+  if (abs(gz_deg) > 0.8) {
     yawAngle += gz_deg * dt;
   }
 
-  // Vòng lặp giám sát góc quay vòng kín (Closed-Loop Turning) chuẩn IMU
-  if (robotState == TURNING) {
-    if (currentCommand.indexOf("LEFT") != -1) {
-      if (yawAngle >= targetYaw) {
-        Serial2.println("CMD:S");
-        robotState = IDLE;
-        currentCommand = "STOP";
-        latestMapLog = "Đã quay xong đúng góc!";
+  // 1. ĐI THẲNG: Tính sai số hướng so với góc gốc Locked Heading
+  if (robotState == STRAIGHT) {
+    float headingError = yawAngle - lockedHeading; 
+    int headingKp = 2; // Giảm hệ số Kp xuống 2 để xe nắn hướng từ từ, tránh giật / quay vòng tròn
+    lastCorrectionVal = (int)(headingError * headingKp);
+    Serial2.println("CORRECTION:" + String(lastCorrectionVal));
+  }
+  // 2. QUAY GÓC 2 CHIỀU
+  else if (robotState == TURNING) {
+    float error = targetYaw - yawAngle; 
+    if (abs(error) <= 0.8) {
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      currentCommand = "STOP";
+      lockedHeading = targetYaw; // CẬP NHẬT GÓC GỐC MỚI SAU KHI QUAY XONG XUÔI!
+      latestMapLog = "Đã quay xong, cập nhật Locked=" + String(lockedHeading, 1) + "°";
+    } 
+    else {
+      int turnPower = constrain(abs(error) * 3.5, 55, 110); // Giảm tốc độ quay để chống trượt quán tính
+      if (error > 0) {
+        Serial2.println("TURNC:L," + String(turnPower));
+      } else {
+        Serial2.println("TURNC:R," + String(turnPower));
       }
-    } else if (currentCommand.indexOf("RIGHT") != -1) {
-      if (yawAngle <= targetYaw) {
-        Serial2.println("CMD:S");
-        robotState = IDLE;
-        currentCommand = "STOP";
-        latestMapLog = "Đã quay xong đúng góc!";
+    }
+  }
+  // 3. CĂN CHỈNH TRƯỚC KHI DỪNG
+  else if (robotState == ALIGN_BEFORE_STOP) {
+    float error = lockedHeading - yawAngle; 
+    if (abs(error) <= 0.8) {
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      currentCommand = "STOP";
+      lastCorrectionVal = 0;
+      latestMapLog = "Đã căn chuẩn hướng gốc, dừng hẳn!";
+    } 
+    else {
+      int alignPower = 60;
+      if (error > 0) {
+        Serial2.println("TURNC:L," + String(alignPower));
+      } else {
+        Serial2.println("TURNC:R," + String(alignPower));
       }
     }
   }
@@ -261,10 +302,11 @@ void loop() {
     }
   }
 
+  // Hiển thị trực quan thông số Yaw, Locked Heading và Sai số bù (Corr) lên OLED 0.96"
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.print("Cmd: "); display.println(currentCommand);
-  display.print("Yaw: "); display.print(yawAngle, 1); display.println(" deg");
+  display.print("Yaw:"); display.print(yawAngle, 1); display.print(" Lck:"); display.println(lockedHeading, 1);
+  display.print("Corr:"); display.print(lastCorrectionVal); display.print(" "); display.println(currentCommand);
   display.print(workerEncoderData);
   display.display();
   

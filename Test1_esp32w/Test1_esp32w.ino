@@ -1,24 +1,38 @@
+/* =====================================================================
+ * PROJECT: Maze Robot Worker Motor & Sensor Controller
+ * FILE: ESP32_Worker_Motor.ino
+ * VERSION: v1.2.7
+ * DATE: 2026-11-14
+ * 
+ * COMPATIBILITY MATRIX:
+ * - Worker v1.2.7 <--> Bắt buộc đi kèm Master v1.2.8
+ * 
+ * CHANGES IN v1.2.7 (SO VỚI v1.2.6):
+ * - Sửa lại công thức bám hướng Tiến/Lùi: Đảo chiều phép toán bù trừ (`liveHeadingCorrection`)
+ *   để triệt tiêu hoàn toàn hiện tượng quay vòng tròn, giúp xe nắn thẳng hướng nhẹ nhàng.
+ * ===================================================================== */
+
 #include <Arduino.h>
 
 const int PWMA = 4;
 const int AIN1 = 13;
-const int AIN2 = 14; // Đã đổi chân AIN2 thành chân 14 theo yêu cầu
-const int STBY = 27;
-const int BIN1 = 26;
+const int AIN2 = 27; 
+const int STBY = 26; 
+const int BIN1 = 33; 
 const int BIN2 = 19;
 const int PWMB = 23;
 
 const int ENC_X_A = 25;
-const int ENC_X_B = 33;
-const int ENC_Y_A = 32;
+const int ENC_X_B = 32; 
+const int ENC_Y_A = 34;
 const int ENC_Y_B = 35;
 
-volatile long encoderXCount = 0; // Động cơ Trái (X)
-volatile long encoderYCount = 0; // Động cơ Phải (Y)
+volatile long encoderXCount = 0; 
+volatile long encoderYCount = 0; 
 
-// Biến Scale nhận từ Web (Có thể tinh chỉnh trực tiếp trên giao diện)
 float scaleX = 1.0; 
 float scaleY = 1.0; 
+int liveHeadingCorrection = 0; 
 
 String currentAction = "STOP";
 String lastActiveAction = "FORWARD";
@@ -41,91 +55,56 @@ void stopRobot() {
   digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
 }
 
-// Hàm điều khiển động cơ Trái (X) tách bạch để tránh liệt chân 14 (AIN2)
 void setMotorLeft(int dir, int speed) {
-  if (dir == 1) { // Tiến
+  if (dir == 1) {
     digitalWrite(AIN1, HIGH);
     digitalWrite(AIN2, LOW);
-  } else if (dir == -1) { // Lùi
+  } else if (dir == -1) {
     digitalWrite(AIN1, LOW);
     digitalWrite(AIN2, HIGH);
-  } else { // Dừng
+  } else {
     digitalWrite(AIN1, LOW);
     digitalWrite(AIN2, LOW);
   }
   analogWrite(PWMA, speed);
 }
 
-// Hàm điều khiển động cơ Phải (Y)
 void setMotorRight(int dir, int speed) {
-  if (dir == 1) { // Tiến
+  if (dir == 1) {
     digitalWrite(BIN1, HIGH);
     digitalWrite(BIN2, LOW);
-  } else if (dir == -1) { // Lùi
+  } else if (dir == -1) {
     digitalWrite(BIN1, LOW);
     digitalWrite(BIN2, HIGH);
-  } else { // Dừng
+  } else {
     digitalWrite(BIN1, LOW);
     digitalWrite(BIN2, LOW);
   }
   analogWrite(PWMB, speed);
 }
 
+// ĐÃ SỬA CHIỀU BÙ HƯỚNG ĐỂ CHỐNG QUAY VÒNG TRÒN KHI TIẾN/LÙI
 void moveStraight(int baseSpeed) {
-  long normalizedX = encoderXCount * scaleX;
-  long normalizedY = encoderYCount * scaleY;
+  // Nếu Yaw > Locked Heading (lệch phải), ta cần giảm tốc bánh Phải và tăng tốc bánh Trái để kéo xe về trái
+  int speedX = baseSpeed + liveHeadingCorrection; // Bánh Trái (X)
+  int speedY = baseSpeed - liveHeadingCorrection; // Bánh Phải (Y)
 
-  long error = normalizedY - normalizedX; 
-  int kp = 3; 
-  int correction = error * kp;
+  speedX = constrain(speedX, 90, 240);
+  speedY = constrain(speedY, 90, 240);
 
-  // ĐÃ BỎ HỆ SỐ 1.15, DÙNG TRỰC TIẾP baseSpeed VÀ DÙNG SCALE ĐỂ CÂN BẰNG
-  int baseSpeedX = baseSpeed; 
-  int baseSpeedY = baseSpeed;       
-
-  int speedX = baseSpeedX + correction; 
-  int speedY = baseSpeedY - correction; 
-
-  speedX = constrain(speedX, 100, 240);
-  speedY = constrain(speedY, 100, 240);
-
-  // Cả hai cùng tiến (dir = 1)
   setMotorLeft(1, speedX);
   setMotorRight(1, speedY);
 }
 
 void moveBackward(int baseSpeed) {
-  long normalizedX = encoderXCount * scaleX;
-  long normalizedY = encoderYCount * scaleY;
+  int speedX = baseSpeed - liveHeadingCorrection;
+  int speedY = baseSpeed + liveHeadingCorrection;
 
-  long error = normalizedY - normalizedX;
-  int kp = 3;
-  int correction = error * kp;
+  speedX = constrain(speedX, 90, 240);
+  speedY = constrain(speedY, 90, 240);
 
-  int baseSpeedX = baseSpeed;
-  int baseSpeedY = baseSpeed;
-
-  int speedX = baseSpeedX + correction;
-  int speedY = baseSpeedY - correction;
-
-  speedX = constrain(speedX, 100, 240);
-  speedY = constrain(speedY, 100, 240);
-
-  // Cả hai cùng lùi (dir = -1)
   setMotorLeft(-1, speedX);
   setMotorRight(-1, speedY);
-}
-
-void turnLeft(int speed) {
-  // Quay trái: Bánh trái lùi (-1), Bánh phải tiến (1)
-  setMotorLeft(-1, speed);
-  setMotorRight(1, speed);
-}
-
-void turnRight(int speed) {
-  // Quay phải: Bánh trái tiến (1), Bánh phải lùi (-1)
-  setMotorLeft(1, speed);
-  setMotorRight(-1, speed);
 }
 
 void setup() {
@@ -134,7 +113,7 @@ void setup() {
 
   pinMode(PWMA, OUTPUT); pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(STBY, OUTPUT); pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(PWMB, OUTPUT);
-  digitalWrite(STBY, HIGH);
+  digitalWrite(STBY, HIGH); 
 
   pinMode(ENC_X_A, INPUT_PULLUP); pinMode(ENC_X_B, INPUT_PULLUP);
   pinMode(ENC_Y_A, INPUT_PULLUP); pinMode(ENC_Y_B, INPUT_PULLUP);
@@ -156,29 +135,19 @@ void loop() {
         encoderXCount = 0; encoderYCount = 0;
         currentAction = "FORWARD";
         lastActiveAction = "FORWARD";
-        Serial2.println("LOG:Đang đi TIẾN");
       } 
       else if (cmd == 'B') {
         encoderXCount = 0; encoderYCount = 0;
         currentAction = "BACKWARD";
         lastActiveAction = "BACKWARD";
-        Serial2.println("LOG:Đang LÙI");
-      } 
-      else if (cmd == 'L') {
-        currentAction = "TURN_LEFT";
-        Serial2.println("LOG:Đang quay TRÁI chuẩn IMU");
-      } 
-      else if (cmd == 'R') {
-        currentAction = "TURN_RIGHT";
-        Serial2.println("LOG:Đang quay PHẢI chuẩn IMU");
       } 
       else if (cmd == 'S') {
         currentAction = "STOP";
-        Serial2.println("LOG:Đã STOP");
+        liveHeadingCorrection = 0;
+        stopRobot();
       } 
       else if (cmd == 'G') {
         currentAction = lastActiveAction;
-        Serial2.println("LOG:Tiếp tục GO");
       }
     } 
     else if (incoming.startsWith("SCALE:")) {
@@ -186,7 +155,21 @@ void loop() {
       if (commaIndex != -1) {
         scaleX = incoming.substring(6, commaIndex).toFloat();
         scaleY = incoming.substring(commaIndex + 1).toFloat();
-        Serial2.println("LOG:Đã cập nhật Scale X=" + String(scaleX) + " Y=" + String(scaleY));
+      }
+    }
+    else if (incoming.startsWith("CORRECTION:")) {
+      liveHeadingCorrection = incoming.substring(11).toInt();
+    }
+    else if (incoming.startsWith("TURNC:")) {
+      currentAction = "DYNAMIC_TURN";
+      char dir = incoming.charAt(6);
+      int spd = incoming.substring(8).toInt();
+      if (dir == 'L') {
+        setMotorLeft(-1, spd);
+        setMotorRight(1, spd);
+      } else {
+        setMotorLeft(1, spd);
+        setMotorRight(-1, spd);
       }
     }
   }
@@ -197,17 +180,13 @@ void loop() {
   else if (currentAction == "BACKWARD") {
     moveBackward(170);
   } 
-  else if (currentAction == "TURN_LEFT") {
-    turnLeft(150);
-  } 
-  else if (currentAction == "TURN_RIGHT") {
-    turnRight(150);
+  else if (currentAction == "DYNAMIC_TURN") {
+    // Đang thực thi quay/căn chỉnh góc
   } 
   else if (currentAction == "STOP") {
     stopRobot();
   }
 
-  // Gửi telemetry xung Encoder về Master mỗi 300ms
   if (millis() - lastSendTime > 300) {
     lastSendTime = millis();
     Serial2.print("ENC:X:");
