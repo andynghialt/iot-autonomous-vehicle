@@ -1,45 +1,35 @@
-=====================================================================
- HỆ THỐNG QUẢN LÝ PHIÊN BẢN & TÀI LIỆU KỸ THUẬT ROBOT MÊ CUNG (MASTER-WORKER)
- NGÀY CẬP NHẬT: 2026-11-17
-=====================================================================
+================================================================================
+PROJECT: AUTONOMOUS MAZE-SOLVING ROBOT WITH 4-DOF ROBOTIC ARM (MASTER/WORKER)
+FILE: Maze_Robot_Version_Log.txt
+LAST UPDATED: 2026-11-20
+================================================================================
 
-1. TỔNG QUAN PHÂN CHIA NHIỆM VỤ PHẦN CỨNG:
-- ESP32 Master (Tên file: ESP32_Master_2026-11-17.ino):
-  + Đóng vai trò là trung tâm điều phối (Gateway), phát Web Server AP để điều khiển từ xa qua điện thoại/máy tính.
-  + Đọc và xử lý trực tiếp cảm biến quán tính MPU6050 (IMU) để tính góc Yaw và khóa hướng (Locked Heading).
-  + Trực tiếp đọc trạng thái phần cứng của cụm 5 mắt IR (quét tường biên) và cảm biến siêu âm HC-SR05 (nhận diện hàng hóa/vật thể).
-  + Hiển thị trực quan thông số telemetry, trạng thái cảm biến lên màn hình OLED 0.96 inch.
-
-- ESP32 Worker (Tên file: ESP32_Worker_2026-11-17.ino):
-  + Đóng vai trò là vi điều khiển chấp hành động cơ thời gian thực.
-  + Điều khiển cầu H TB6612FNG (sử dụng chân AIN2 ở GPIO 27 để đảm bảo an toàn phần cứng, tránh strapping pin).
-  + Đọc xung ngắt (Interrupt) từ Encoder 2 bánh xe để đo quãng đường di chuyển.
-  + Thực thi các tập lệnh di chuyển: Tiến thẳng liên tục, Tiến chuẩn 1 ô lưới (30cm), Quay góc vòng kín (Closed-loop Turn), và cơ chế lùi nhẹ (Micro-reverse) để đưa tâm xe về đúng tâm ô lưới.
-
-
-2. CHI TIẾT CÁC TÍNH NĂNG VÀ THUẬT TOÁN (ACTIVE FEATURES & ALGORITHMS):
-
-A. TRONG FILE MASTER (`ESP32_Master_2026-11-17.ino`):
-- Active Feature 1: Web-based Real-time Telemetry & Scale Config:
-  + Cung cấp giao diện HTML cục bộ qua Wi-Fi Access Point cho phép gửi lệnh điều khiển (Tiến, Quay 90°, Quay đầu 180°, Dừng) và tinh chỉnh hệ số scaleX/scaleY trực tiếp.
-- Active Feature 2: Heading-Locked Straight Navigation (Bám hướng thời gian thực):
-  + Lấy góc Yaw làm mốc khi bắt đầu di chuyển, sử dụng sai số góc liên tục điều chỉnh bù trừ vào tốc độ PWM của 2 bánh giúp xe đi thẳng tuyệt đối, triệt tiêu hiện tượng đi vòng cung.
-- Active Feature 3: Bi-directional Closed-Loop Turn & Stop Alignment:
-  + Tự động hãm tốc tiệm cận khi gần đến góc mục tiêu để triệt tiêu quán tính, đồng thời tự động căn chỉnh trả về đúng góc gốc (Locked Heading) trước khi dừng hẳn.
-- Active Feature 4: Centralized Sensor Data Acquisition:
-  + Quản lý trực tiếp các chân đọc tín hiệu số của 5 mắt IR và đo khoảng cách siêu âm HC-SR05.
-
-B. TRONG FILE WORKER (`ESP32_Worker_2026-11-17.ino`):
-- Active Feature 1: Safe Hardware Pinmapping:
-  + Sử dụng chân AIN2 ở GPIO 27, loại bỏ hoàn toàn xung đột phần cứng khi khởi động.
-- Active Feature 2: Real-time Heading Correction Integration:
-  + Tiếp nhận giá trị sai số (`CORRECTION`) từ Master để tinh chỉnh chênh lệch PWM giữa 2 bánh ngay trong lúc chạy thẳng.
-- Active Feature 3: Dead Reckoning Cell Movement & Micro-reverse:
-  + Đếm xung encoder chính xác theo hằng số `TICKS_PER_CELL` (đã tối ưu hóa thực tế ở mức 350 xung cho 30cm). Khi đi đủ quãng đường 1 ô, tự động kích hoạt chu trình lùi nhẹ (Micro-reverse) trong thời gian ngắn để căn chuẩn tâm xe, chuẩn bị cho các bước rẽ vuông góc tối ưu.
-
-
-3. NHẬT KÝ NÂNG CẤP & SỬA ĐỔI (CHANGELOG SO VỚI CÁC BẢN TRƯỚC):
-- Sửa lỗi định nghĩa phần cứng: Chuyển toàn bộ chân cảm biến 5 mắt IR và siêu âm HC-SR05 về cắm trực tiếp vào ESP32 Master, tách biệt rõ ràng Master (xử lý logic cấp cao, cảm biến, giao diện) và Worker (chấp hành động cơ, encoder).
-- Tối ưu hóa hành vi di chuyển ô lưới: Thêm cơ chế lùi chỉnh vạch tự động trong Worker khi kết thúc lệnh `CELL_FWD` để chống trượt bánh và đảm bảo trục quay nằm đúng tâm ô.
-- Đổi tên file chuẩn hóa theo định dạng ngày tháng hiện tại (`2026-11-17`) và tách toàn bộ chú thích ma trận/tính năng vào file text quản lý chung này theo đúng yêu cầu.
-=====================================================================
+[v2026-11-20 - STABLE] 2-Tab Web UI, 2-Button Jog + Special Hip Mode & Power Isolation
+- Firmware Files:
+  * ESP32_Master_2026-11-20.ino
+  * ESP32_Worker_2026-11-20.ino
+- Power & Stability Fixes:
+  * Tách nhánh nguồn riêng (XL4016 chỉnh ~5V-6V + tụ bù dòng, nối chung GND)
+    cho cụm 4 servo (1x MG996R + 3x SG90) để tránh sụt áp gây mất Wi-Fi/brownout
+    trên ESP32 Master. Không cấp tải servo qua AMS1117.
+  * Không attach / xuất xung servo trong setup() của Worker -> robot khởi động
+    đứng yên hoàn toàn, không tự giật tay máy.
+  * Tự động ngắt xung (detach) sau 0.5s (500ms) cho thao tác tay máy thông thường
+    nhằm giảm tải và bảo vệ khớp khi gặp ma sát nghỉ / kẹt trục cơ khí.
+- Web UI (2 Tabs):
+  * Tab 1 (Điều khiển xe): Tiến 1 ô (30cm), Đi thẳng liên tục, Quay trái/phải 90°,
+    Quay đầu 180°, Reset Yaw & Locked = 0°, Stop & căn chỉnh gốc, Scale X/Y.
+  * Tab 2 (Cánh tay 4 bậc - 2 nút / khớp):
+    - S1 (Tay gắp SG90): Chạy từ từ (sweep) tới góc 90° hoặc 0°.
+    - S2 & S3 (2 khớp hông SG90): Hỗ trợ bấm giữ/nhấp nhích góc, bước nhảy nhanh
+      (-15°, -30°, -60°, -90° / +15°, +30°, +60°, +90°), và chạy đồng bộ ngược dấu
+      ("Cùng đưa tới" / "Cùng thu về") cho 2 khớp đối diện.
+    - S4 (Đế xoay MG996R 360°): Điều khiển chiều/tốc độ quay quanh mốc dừng 90°,
+      nhả nút tự dừng (90).
+    - Chế độ đặc biệt (ARMSP): S2 -> 180° (0.5s rồi ngắt xung), sau đó gọi 90°
+      3 lần liên tiếp (mỗi lần 0.5s và có ngắt xung).
+    - Nút "Ngắt xung servo (Thả đứng yên)" gửi lệnh ARM_OFF.
+- Hardware & Sensor Notes:
+  * Cảm biến IR 5 mắt: Nền đen = 1, Nền trắng = 0.
+  * HC-SR05 dùng cho nhận diện vật thể/hàng hóa, không tham gia logic dò line/tường.
+  * MPU6050 dùng deadband gyro (GYRO_DEADBAND = 1.8) để hạn chế trôi yaw khi đứng yên.
