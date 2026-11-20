@@ -1,7 +1,5 @@
-﻿
-# **🤖 Dual-ESP32 Autonomous Maze Solver & Warehouse Robot (4-DOF Arm)**
+﻿# **🤖 Dual-ESP32 Autonomous Maze Solver & Warehouse Robot (4-DOF Arm)**
 Dự án Robot tự hành giải mê cung và hỗ trợ vận chuyển hàng hóa tích hợp cánh tay gắp 4 bậc tự do (**4-DOF Robotic Arm**), xây dựng trên kiến trúc phần cứng phân tán **Dual-ESP32 (Master-Worker)**. Robot sử dụng hệ thống định vị hỗn hợp **Dead Reckoning (Encoder + IMU MPU6050)** kết hợp ô lưới (Grid-based Cell Navigation) để khám phá sa bàn, nhận diện vạch biên đen bằng cảm biến hồng ngoại và phát hiện vật thể/hàng hóa bằng cảm biến siêu âm.
-
 ## **📌 1. Tổng quan kiến trúc hệ thống (Master-Worker Architecture)**
 Hệ thống được chia thành 2 vi điều khiển ESP32 giao tiếp với nhau qua giao thức **UART (Serial2)** nhằm tách bạch việc xử lý giao diện mạng/cảm biến quán tính với điều khiển động cơ và servo thời gian thực:
 ### **🎛️ ESP32 Master (Gateway & Sensor Hub)**
@@ -10,7 +8,7 @@ Hệ thống được chia thành 2 vi điều khiển ESP32 giao tiếp với n
   - Phát mạng **Wi-Fi Access Point (AP)** (Maze\_Solver\_AP) tích hợp Web Server giao diện **2 Tab Menu** (Điều khiển xe & Cánh tay 4 bậc) cho phép điều khiển và giám sát từ xa.
   - Đọc và xử lý trực tiếp cảm biến quán tính **MPU6050 (IMU)** tính toán góc Yaw, duy trì **Locked Heading** và lọc nhiễu tĩnh (GYRO\_DEADBAND).
   - Quản lý trực tiếp cụm **5 mắt cảm biến hồng ngoại (IR)** (nền đen = 1, nền trắng = 0) và cảm biến siêu âm **HC-SR05** chuyên dụng nhận diện vật thể/hàng hóa.
-  - Hiển thị thông số Telemetry và trạng thái hệ thống lên màn hình **OLED (I2C** 0x3C**)**.
+  - Hiển thị thông số Telemetry và trạng thái hệ thống lên màn hình **OLED (I2C** 0x3C\*\*)\*\*.
 ### **⚙️ ESP32 Worker (Motor, Encoder & 4-DOF Arm Unit)**
 - **Nhiệm vụ chính:** Chấp hành điều khiển động cơ bánh xe và cụm 4 servo cánh tay.
 - **Chức năng:**
@@ -30,7 +28,7 @@ Hệ thống được chia thành 2 vi điều khiển ESP32 giao tiếp với n
       1. **S1 (Tay gắp SG90):** Chạy từ từ (sweep) tới 90° hoặc 0° để có lực đóng/mở đều.
       1. **S2 & S3 (2 khớp hông SG90):** Hỗ trợ bấm giữ/nhấp nhích góc, bước góc nhanh (-15°, -30°, -60°, -90° / +15°, +30°, +60°, +90°) và chạy đồng bộ ngược dấu (**Cùng đưa tới / Cùng thu về**) cho 2 khớp đối diện.
       1. **S4 (Đế xoay MG996R 360°):** Điều khiển chiều/tốc độ quanh mốc dừng 90°, nhả nút tự dừng (90).
-      1. **Chế độ đặc biệt (**ARMSP**):** Đưa S2 lên 180° (ngắt xung sau 0.5s), sau đó gọi 90° **3 lần liên tiếp** (mỗi lần 0.5s và có ngắt xung).
+      1. **Chế độ đặc biệt (ARMSP):** Đưa S2 lên 180° (ngắt xung sau 0.5s), sau đó gọi 90° **3 lần liên tiếp** (mỗi lần 0.5s và có ngắt xung).
       1. **Bảo vệ cơ khí & nguồn:** Không xuất xung servo khi khởi động, tự ngắt xung (detach) sau 0.5s mỗi thao tác và có nút ngắt xung thủ công trên Web.
 ## **⚡ 3. Lưu ý cấp nguồn (Power Isolation)**
 - **Tách nhánh nguồn riêng cho Servo:** Cấp nguồn riêng cho cụm 4 servo qua mạch hạ áp Buck dòng cao (như **XL4016**, chỉnh khoảng 5V–6V) kèm tụ lọc bù dòng, **nối chung** GND với toàn bộ hệ thống. Không cấp tải servo qua AMS1117 để tránh sụt áp gây mất Wi-Fi/brownout trên ESP32 Master.
@@ -70,9 +68,3 @@ Plaintext
 ` `┣ 📜 Maze\_Robot\_Version\_Log.txt       # Nhật ký quản lý phiên bản và tài liệu kỹ thuật
 
 ` `┗ 📜 README.md                        # Tài liệu giới thiệu dự án
-### **Gợi ý Git Commit cho bản** 2026-11-20
-Bash
-
-git add .
-
-git commit -m "feat(arm): add 2-tab web UI, 4-DOF arm controls, and 0.5s servo auto-detach"

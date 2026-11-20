@@ -1,5 +1,5 @@
 /* =====================================================================
- * PROJECT: Maze Solver Master-Gateway + 2-Tab Web UI
+ * PROJECT: Maze Solver Master-Gateway + 2-Tab Web UI + Special Arm Mode
  * FILE: ESP32_Master_2026-11-20.ino
  * DATE: 2026-11-20
  * NOTE: Cảm biến IR 5 mắt: Nền đen = Bật/1, Nền trắng = Tắt (0).
@@ -88,10 +88,11 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     .btn-step-r { background: #ff9800; padding: 7px 4px; font-size: 11px; }
     .btn-twin-fwd { background: #2e7d32; padding: 10px 6px; font-size: 12px; }
     .btn-twin-back { background: #6a1b9a; padding: 10px 6px; font-size: 12px; }
+    .btn-special { background: #ad1457; width: 100%; padding: 10px; font-size: 12px; margin-bottom: 8px; }
 
     .btn-jog-l { background: #1976d2; padding: 10px; font-size: 13px; }
     .btn-jog-r { background: #e65100; padding: 10px; font-size: 13px; }
-    .btn-jog-l:active, .btn-jog-r:active, .btn-step-l:active, .btn-step-r:active, .btn-twin-fwd:active, .btn-twin-back:active { opacity: 0.75; transform: scale(0.98); }
+    .btn-jog-l:active, .btn-jog-r:active, .btn-step-l:active, .btn-step-r:active, .btn-twin-fwd:active, .btn-twin-back:active, .btn-special:active { opacity: 0.75; transform: scale(0.98); }
     .btn-release { background: #607d8b; width: 100%; margin-top: 4px; padding: 9px; font-size: 12px; }
 
     .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 11px; font-weight: bold; max-width: 350px; margin-left: auto; margin-right: auto; line-height: 1.3; text-align: left; }
@@ -127,12 +128,14 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
   <!-- TRANG 2: ĐIỀU KHIỂN CÁNH TAY -->
   <div id="pageArm" class="page">
-    <!-- S1: Tay gắp 2 chế độ 90 độ và 0 độ -->
+    <button class="btn-special" onclick="runSpecialMode()">CHẾ ĐỘ ĐẶC BIỆT (S2: 180° [0.5s] -> 90° x3 LẦN)</button>
+
+    <!-- S1: Tay gắp chạy từ từ tới 90 độ hoặc 0 độ -->
     <div class="servo-card">
-      <div class="servo-header"><span>S1 - Tay gắp (2 chế độ 90° / 0°)</span><span id="ang1">90°</span></div>
+      <div class="servo-header"><span>S1 - Tay gắp (Chạy từ từ 90° / 0°)</span><span id="ang1">90°</span></div>
       <div class="servo-btns">
-        <button class="btn-jog-l" onclick="setGripAngle(90)">ĐÓNG (90°)</button>
-        <button class="btn-jog-r" onclick="setGripAngle(0)">MỞ (0°)</button>
+        <button class="btn-jog-l" onclick="sweepGripTo(90)">ĐÓNG TỪ TỪ (90°)</button>
+        <button class="btn-jog-r" onclick="sweepGripTo(0)">MỞ TỪ TỪ (0°)</button>
       </div>
     </div>
 
@@ -240,11 +243,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       fetch('/arm_twin?s2=' + a2 + '&s3=' + a3);
     }
 
-    function setGripAngle(angle) {
+    // Tay gắp S1 chạy từ từ tới góc đích (90 hoặc 0)
+    function sweepGripTo(targetAngle) {
       stopJog();
       stopTwinJog();
-      servoAngles[1] = angle;
-      pushServo(1, angle);
+      servoAngles[1] = targetAngle;
+      document.getElementById('ang1').innerText = targetAngle + '°';
+      fetch('/arm_grip_sweep?target=' + targetAngle);
     }
 
     function stepByAngle(id, delta) {
@@ -281,7 +286,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       if (jogTimer) { clearInterval(jogTimer); jogTimer = null; }
     }
 
-    // 2 servo hông đối diện nhau: đi cùng hướng cơ khí (đưa tới / thu về) bằng cách đổi dấu ngược nhau
     function stepTwin(dir) {
       let n2 = Math.max(0, Math.min(180, servoAngles[2] + dir * 2));
       let n3 = Math.max(0, Math.min(180, servoAngles[3] - dir * 2));
@@ -312,6 +316,15 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     function stopBase() {
       document.getElementById('ang4').innerText = 'DỪNG';
       fetch('/arm_single?id=4&ang=90');
+    }
+
+    function runSpecialMode() {
+      stopJog();
+      stopTwinJog();
+      servoAngles[2] = 90;
+      document.getElementById('ang2').innerText = '90°';
+      updateTwinLabel();
+      fetch('/arm_special');
     }
 
     function releaseArm() {
@@ -369,7 +382,7 @@ void handleArmSingle() {
     int id = constrain(server.arg("id").toInt(), 1, 4);
     int ang = constrain(server.arg("ang").toInt(), 0, 180);
     Serial2.println("ARMS:" + String(id) + "," + String(ang));
-    latestMapLog = "Servo S" + String(id) + " -> " + String(ang);
+    latestMapLog = "Servo S" + String(id) + " -> " + String(ang) + " (0.5s ngắt)";
     server.send(200, "text/plain", "OK");
   }
 }
@@ -379,9 +392,24 @@ void handleArmTwin() {
     int a2 = constrain(server.arg("s2").toInt(), 0, 180);
     int a3 = constrain(server.arg("s3").toInt(), 0, 180);
     Serial2.println("ARMT:" + String(a2) + "," + String(a3));
-    latestMapLog = "Twin S2:" + String(a2) + "° S3:" + String(a3) + "°";
+    latestMapLog = "Twin S2:" + String(a2) + "° S3:" + String(a3) + "° (0.5s ngắt)";
     server.send(200, "text/plain", "OK");
   }
+}
+
+void handleArmGripSweep() {
+  if (server.hasArg("target")) {
+    int target = constrain(server.arg("target").toInt(), 0, 90);
+    Serial2.println("GRIPS:" + String(target));
+    latestMapLog = "Tay gắp chạy từ từ -> " + String(target) + "°";
+    server.send(200, "text/plain", "OK");
+  }
+}
+
+void handleArmSpecial() {
+  Serial2.println("ARMSP");
+  latestMapLog = "Chế độ đặc biệt: S2 180° -> 90° x3 (mỗi bước 0.5s & ngắt xung)";
+  server.send(200, "text/plain", "OK");
 }
 
 void handleArmRelease() {
@@ -450,6 +478,8 @@ void setup() {
   server.on("/cmd", handleCmd);
   server.on("/arm_single", handleArmSingle);
   server.on("/arm_twin", handleArmTwin);
+  server.on("/arm_grip_sweep", handleArmGripSweep);
+  server.on("/arm_special", handleArmSpecial);
   server.on("/arm_release", handleArmRelease);
   server.on("/scale", handleScale);
   server.on("/getdata", handleGetData);
