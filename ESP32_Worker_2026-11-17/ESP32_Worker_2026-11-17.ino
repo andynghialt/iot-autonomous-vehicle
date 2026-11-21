@@ -1,8 +1,9 @@
 /* =====================================================================
  * PROJECT: Maze Solver Worker Motor Controller + 4-DOF Arm Servo Driver
- * FILE: ESP32_Worker_2026-11-20.ino
- * DATE: 2026-11-20
- * NOTE: Tự động ngắt xung sau 0.5s (500ms) cho mọi thao tác tay máy để bảo vệ kẹt trục.
+ * FILE: ESP32_Worker_2026-11-21.ino
+ * DATE: 2026-11-21
+ * NOTE: Hỗ trợ thêm lệnh CMD:R (lùi nhẹ trước khi quay) và báo CELL_DONE.
+ *       Tự động ngắt xung sau 0.5s (500ms) cho mọi thao tác tay máy.
  * ===================================================================== */
 
 #include <Arduino.h>
@@ -19,7 +20,6 @@ const int PWMB = 23;
 const int ENC_X_A = 25; const int ENC_X_B = 32; 
 const int ENC_Y_A = 34; const int ENC_Y_B = 35;
 
-// Chân điều khiển 4 servo cánh tay
 const int SERVO_GRIP_PIN = 22; // S1: SG90 tay gắp
 const int SERVO_ARM1_PIN = 18; // S2: SG90 khớp hông 1
 const int SERVO_ARM2_PIN = 21; // S3: SG90 khớp hông 2
@@ -35,19 +35,14 @@ bool arm1Attached = false;
 bool arm2Attached = false;
 bool baseAttached = false;
 
-// Quản lý tự động ngắt xung sau 0.5s (500ms) cho thao tác thông thường
 unsigned long autoDetachAt = 0;
 bool autoDetachArmed = false;
 
-// Quản lý sweep từ từ cho tay gắp S1
 bool gripSweeping = false;
 int currentGripAngle = 90;
 int targetGripAngle = 90;
 unsigned long lastGripStepTime = 0;
 
-// Quản lý chế độ đặc biệt cho S2:
-// Step 1: S2 -> 180°, giữ 0.5s rồi ngắt xung
-// Step 2..4: gọi 90° 3 lần liên tiếp, mỗi lần 0.5s rồi ngắt xung (đảm bảo trước khi gọi mỗi lần đều có ngắt xung)
 enum SpecialStage { SPEC_NONE, SPEC_180_HOLD, SPEC_90_A, SPEC_90_B, SPEC_90_C };
 SpecialStage specialStage = SPEC_NONE;
 unsigned long specialTimer = 0;
@@ -137,7 +132,6 @@ void startGripSweep(int target) {
 }
 
 void startSpecialSequence() {
-  // Đảm bảo trước khi bắt đầu chuỗi đều đã ngắt xung sạch
   detachAllServos();
   gripSweeping = false;
   attachServoIfNeeded(2);
@@ -150,7 +144,6 @@ void startSpecialSequence() {
 void updateArmTasks() {
   unsigned long now = millis();
 
-  // 1. Chạy từ từ cho tay gắp S1 để có lực đóng/mở đều
   if (gripSweeping && (now - lastGripStepTime >= 18)) {
     lastGripStepTime = now;
     if (currentGripAngle < targetGripAngle) {
@@ -165,24 +158,23 @@ void updateArmTasks() {
     }
   }
 
-  // 2. Chế độ đặc biệt: S2 180° (0.5s -> ngắt) rồi gọi 90° 3 lần (mỗi lần có ngắt xung trước khi gọi & sau 0.5s)
   if (specialStage != SPEC_NONE) {
     if (specialStage == SPEC_180_HOLD && (now - specialTimer >= 500)) {
-      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; } // ngắt xung sau 0.5s
+      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; }
       attachServoIfNeeded(2);
       servoArm1.write(90);
       specialStage = SPEC_90_A;
       specialTimer = now;
       Serial2.println("LOG:Spec B2 (Lần 1/3) -> S2:90°");
     } else if (specialStage == SPEC_90_A && (now - specialTimer >= 500)) {
-      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; } // ngắt xung trước lần gọi tiếp theo
+      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; }
       attachServoIfNeeded(2);
       servoArm1.write(90);
       specialStage = SPEC_90_B;
       specialTimer = now;
       Serial2.println("LOG:Spec B2 (Lần 2/3) -> S2:90°");
     } else if (specialStage == SPEC_90_B && (now - specialTimer >= 500)) {
-      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; } // ngắt xung trước lần gọi thứ 3
+      if (arm1Attached) { servoArm1.detach(); arm1Attached = false; }
       attachServoIfNeeded(2);
       servoArm1.write(90);
       specialStage = SPEC_90_C;
@@ -195,7 +187,6 @@ void updateArmTasks() {
     }
   }
 
-  // 3. Tự động ngắt xung sau 0.5s cho thao tác thường
   if (autoDetachArmed && !gripSweeping && specialStage == SPEC_NONE && (now >= autoDetachAt)) {
     detachAllServos();
   }
@@ -229,6 +220,7 @@ void loop() {
       char cmd = incoming.charAt(4);
       if (cmd == 'C') { encoderXCount = 0; encoderYCount = 0; currentAction = "CELL_FWD"; }
       else if (cmd == 'F') { encoderXCount = 0; encoderYCount = 0; currentAction = "FORWARD"; lastActiveAction = "FORWARD"; }
+      else if (cmd == 'R') { currentAction = "REVERSE_微"; setMotorLeft(-1, 100); setMotorRight(-1, 100); }
       else if (cmd == 'S') { currentAction = "STOP"; liveHeadingCorrection = 0; stopRobot(); }
     } else if (incoming.startsWith("ARMS:")) {
       int comma = incoming.indexOf(',', 5);
@@ -278,6 +270,7 @@ void loop() {
       
       stopRobot(); 
       currentAction = "STOP";
+      Serial2.println("CELL_DONE");
       Serial2.println("LOG:Đã đi xong 1 ô 30cm và lùi chỉnh về tâm chuẩn!");
     } 
     else {

@@ -1,9 +1,9 @@
 /* =====================================================================
- * PROJECT: Maze Solver Master-Gateway + 2-Tab Web UI + Special Arm Mode
- * FILE: ESP32_Master_2026-11-20.ino
- * DATE: 2026-11-20
- * NOTE: Cảm biến IR 5 mắt: Nền đen = Bật/1, Nền trắng = Tắt (0).
- *       S4 (MG996R) là loại 360 độ (điều khiển chiều/tốc độ, 90 = dừng).
+ * PROJECT: Dual-ESP32 Autonomous Maze Solver + 3x US + 2x IR + Canvas Map
+ * FILE: ESP32_Master_2026-11-21.ino
+ * DATE: 2026-11-21
+ * NOTE: IR: Nền đen = 1, Nền trắng = 0.
+ *       3x US (Front, Left, Right) kích tuần tự tránh nhiễu chéo.
  * ===================================================================== */
 
 #include <WiFi.h>
@@ -25,30 +25,140 @@ const char* password = "12345678";
 
 WebServer server(80);
 
-const int IR_1 = 32; 
-const int IR_2 = 33; 
-const int IR_3 = 25; 
-const int IR_4 = 26; 
-const int IR_5 = 27; 
+// 3 cảm biến siêu âm HC-SR05 (Trái - Trước - Phải)
+const int US_FRONT_TRIG = 13;
+const int US_FRONT_ECHO = 14;
+const int US_LEFT_TRIG  = 32;
+const int US_LEFT_ECHO  = 33;
+const int US_RIGHT_TRIG = 25;
+const int US_RIGHT_ECHO = 26;
 
-const int US_TRIG = 13; 
-const int US_ECHO = 14;
+// 2 cảm biến IR đơn: 1 cái chĩa trước (nhận diện line trên vật thể/hàng), 1 cái chĩa xuống sàn (vạch xuất phát)
+const int IR_FRONT = 27;
+const int IR_FLOOR = 12;
 
-// Ngưỡng lọc nhiễu gyro (deg/s) khi đứng yên để chống tự tăng Yaw
-const float GYRO_DEADBAND = 1.8;
+// Ngưỡng khoảng cách (cm) & ngưỡng nhận diện hàng
+const int WALL_DIST_CM = 18;
+const int CARGO_DIST_CM = 20;
+
+// Hạ deadband để không mất góc khi xe quay chậm gần tới góc đích
+const float GYRO_DEADBAND = 0.4;
 
 String currentCommand = "STOP";
 float yawAngle = 0;
 float targetYaw = 0;
-float lockedHeading = 0; 
+float lockedHeading = 0;
 int lastCorrectionVal = 0;
 unsigned long lastTime = 0;
 float gz_offset = 0;
-String latestMapLog = "Sẵn sàng giải mê cung...";
+String latestMapLog = "Sẵn sàng (Chế độ 1: Dò map | Chế độ 2: Chuyển hàng)";
 String workerEncoderData = "Enc: X:0 Y:0";
 
 enum RobotState { IDLE, STRAIGHT, TURNING, ALIGN_BEFORE_STOP, CELL_FORWARD };
 RobotState robotState = IDLE;
+
+// 0 = Thủ công / Chờ, 1 = Chế độ 1 (Dò mê cung & lưu map), 2 = Chế độ 2 (Chuyển hàng thử nghiệm)
+int autoMode = 0;
+bool mapSaved = false;
+int cellsMovedSinceStart = 0;
+unsigned long lastStartLineTrigger = 0;
+
+// Bản đồ lưới 11x11 (tâm tại 5,5 = điểm xuất phát)
+// bit 0 (1): tường Bắc, bit 1 (2): tường Đông, bit 2 (4): tường Nam, bit 3 (8): tường Tây, bit 4 (16): có cờ hàng
+const int GRID_SIZE = 11;
+uint8_t mapGrid[GRID_SIZE][GRID_SIZE];
+int robotGX = 5, robotGY = 5;
+int robotDir = 0; // 0: Bắc (lên), 1: Đông (phải), 2: Nam (xuống), 3: Tây (trái)
+
+enum AutoStep {
+  AUTO_IDLE,
+  AUTO_SCAN_AND_DECIDE,
+  AUTO_WAIT_REVERSE,
+  AUTO_WAIT_TURN,
+  AUTO_WAIT_CELL_FWD,
+  AUTO_CARGO_DEMO
+};
+AutoStep autoStep = AUTO_IDLE;
+int pendingTurnDelta = 0; // +90 trái, -90 phải, +180 quay đầu
+bool pendingReverseBeforeTurn = false;
+unsigned long stepTimeoutAt = 0;
+
+long distFront = 999, distLeft = 999, distRight = 999;
+int irFrontVal = 0, irFloorVal = 0;
+
+long readUltrasonicPin(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 14000);
+  if (duration == 0) return 999;
+  long d = duration * 0.034 / 2;
+  if (d <= 0 || d > 300) return 999;
+  return d;
+}
+
+void scanSensorsSequential() {
+  // Kích từng cảm biến siêu âm cách nhau ~35ms để không dội sóng chéo
+  distFront = readUltrasonicPin(US_FRONT_TRIG, US_FRONT_ECHO);
+  delay(35);
+  distLeft = readUltrasonicPin(US_LEFT_TRIG, US_LEFT_ECHO);
+  delay(35);
+  distRight = readUltrasonicPin(US_RIGHT_TRIG, US_RIGHT_ECHO);
+  delay(35);
+
+  irFrontVal = digitalRead(IR_FRONT); // 1 = nền đen (line trên vật thể/hàng), 0 = nền trắng
+  irFloorVal = digitalRead(IR_FLOOR); // 1 = nền đen (vạch line ngang xuất phát), 0 = nền trắng
+}
+
+void markCurrentCellWalls() {
+  // Cập nhật tường theo hướng hiện tại của xe
+  // Trái = (robotDir + 3) % 4, Phải = (robotDir + 1) % 4, Sau = (robotDir + 2) % 4
+  int dLeft = (robotDir + 3) % 4;
+  int dRight = (robotDir + 1) % 4;
+  int dFront = robotDir;
+
+  if (distLeft > 0 && distLeft < WALL_DIST_CM) mapGrid[robotGY][robotGX] |= (1 << dLeft);
+  if (distRight > 0 && distRight < WALL_DIST_CM) mapGrid[robotGY][robotGX] |= (1 << dRight);
+
+  if (distFront > 0 && distFront < WALL_DIST_CM) {
+    mapGrid[robotGY][robotGX] |= (1 << dFront);
+    // Nếu trước mặt có vật cản/tường kèm line đen trên vật thể -> đánh cờ có hàng
+    if (irFrontVal == 1 && distFront <= CARGO_DIST_CM) {
+      mapGrid[robotGY][robotGX] |= 16;
+      latestMapLog = "Phát hiện HÀNG (Tường + Line vật thể) tại (" + String(robotGX - 5) + "," + String(5 - robotGY) + ")!";
+    }
+  }
+}
+
+void advanceGridPosition() {
+  if (robotDir == 0 && robotGY > 0) robotGY--;
+  else if (robotDir == 1 && robotGX < GRID_SIZE - 1) robotGX++;
+  else if (robotDir == 2 && robotGY < GRID_SIZE - 1) robotGY++;
+  else if (robotDir == 3 && robotGX > 0) robotGX--;
+  cellsMovedSinceStart++;
+}
+
+void updateRobotDirFromTurn(int deltaDeg) {
+  int steps = (int)round(deltaDeg / 90.0);
+  robotDir = (robotDir - steps) % 4;
+  if (robotDir < 0) robotDir += 4;
+}
+
+void startTurnToTarget(float newTargetYaw, const String& logMsg) {
+  targetYaw = newTargetYaw;
+  robotState = TURNING;
+  currentCommand = "TURNING";
+  latestMapLog = logMsg;
+}
+
+void startOneCellForward() {
+  Serial2.println("CMD:C");
+  robotState = CELL_FORWARD;
+  currentCommand = "CELL_FWD";
+  stepTimeoutAt = millis() + 5000;
+}
 
 const char MAIN_page[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -61,11 +171,16 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     body { font-family: Arial, sans-serif; text-align: center; margin: 8px; background: #f0f2f5; user-select: none; -webkit-user-select: none; }
     h1 { color: #333; font-size: 16px; margin: 4px 0 8px 0; }
     
-    .tabs { display: flex; max-width: 350px; margin: 0 auto 8px auto; border-radius: 8px; overflow: hidden; border: 1px solid #1565c0; }
+    .tabs { display: flex; max-width: 360px; margin: 0 auto 8px auto; border-radius: 8px; overflow: hidden; border: 1px solid #1565c0; }
     .tab-btn { flex: 1; padding: 10px; font-size: 13px; font-weight: bold; border: none; cursor: pointer; background: #fff; color: #1565c0; }
     .tab-btn.active { background: #1565c0; color: #fff; }
-    .page { display: none; max-width: 350px; margin: 0 auto; }
+    .page { display: none; max-width: 360px; margin: 0 auto; }
     .page.active { display: block; }
+
+    .mode-bar { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+    .btn-mode1 { background: #1b5e20; padding: 10px; font-size: 12px; }
+    .btn-mode2 { background: #e65100; padding: 10px; font-size: 12px; }
+    .btn-mode-stop { background: #37474f; grid-column: span 2; padding: 8px; font-size: 12px; }
 
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     button { padding: 9px; font-size: 12px; cursor: pointer; border-radius: 6px; border: none; color: white; font-weight: bold; }
@@ -79,6 +194,10 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
     .panel { background: #fff; padding: 8px; border-radius: 6px; margin-top: 8px; text-align: left; font-size: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     .panel input[type="number"] { width: 65px; padding: 3px; }
+
+    .map-card { background: #fff; padding: 8px; border-radius: 6px; margin-top: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .map-title { font-size: 12px; font-weight: bold; margin-bottom: 4px; color: #222; display: flex; justify-content: space-between; }
+    canvas { border: 1px solid #bbb; border-radius: 4px; background: #fafafa; display: block; margin: 0 auto; }
 
     .servo-card { background: #fff; padding: 8px; border-radius: 6px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     .servo-header { display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; margin-bottom: 6px; color: #222; }
@@ -95,20 +214,26 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
     .btn-jog-l:active, .btn-jog-r:active, .btn-step-l:active, .btn-step-r:active, .btn-twin-fwd:active, .btn-twin-back:active, .btn-special:active { opacity: 0.75; transform: scale(0.98); }
     .btn-release { background: #607d8b; width: 100%; margin-top: 4px; padding: 9px; font-size: 12px; }
 
-    .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 11px; font-weight: bold; max-width: 350px; margin-left: auto; margin-right: auto; line-height: 1.3; text-align: left; }
-    .log-box { margin-top: 6px; background: #000; color: #0f0; padding: 6px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 10px; height: 48px; overflow-y: auto; max-width: 350px; margin-left: auto; margin-right: auto; }
+    .telemetry { background: #e3f2fd; color: #0d47a1; padding: 6px; border-radius: 6px; margin-top: 8px; font-size: 11px; font-weight: bold; max-width: 360px; margin-left: auto; margin-right: auto; line-height: 1.3; text-align: left; }
+    .log-box { margin-top: 6px; background: #000; color: #0f0; padding: 6px; border-radius: 6px; text-align: left; font-family: monospace; font-size: 10px; height: 52px; overflow-y: auto; max-width: 360px; margin-left: auto; margin-right: auto; }
   </style>
 </head>
 <body>
   <h1>MAZE SOLVER & ARM CONTROL</h1>
 
   <div class="tabs">
-    <button id="tabCarBtn" class="tab-btn active" onclick="switchTab('car')">1. ĐIỀU KHIỂN XE</button>
+    <button id="tabCarBtn" class="tab-btn active" onclick="switchTab('car')">1. XE & BẢN ĐỒ</button>
     <button id="tabArmBtn" class="tab-btn" onclick="switchTab('arm')">2. CÁNH TAY 4 BẬC</button>
   </div>
 
-  <!-- TRANG 1: ĐIỀU KHIỂN XE -->
+  <!-- TRANG 1: XE & BẢN ĐỒ -->
   <div id="pageCar" class="page active">
+    <div class="mode-bar">
+      <button class="btn-mode1" onclick="setMode(1)">NÚT 1: DÒ MAP & LƯU</button>
+      <button class="btn-mode2" onclick="setMode(2)">NÚT 2: CHUYỂN HÀNG</button>
+      <button class="btn-mode-stop" onclick="setMode(0)">DỪNG CHẾ ĐỘ TỰ ĐỘNG</button>
+    </div>
+
     <div class="grid">
       <button class="btn-cell" onclick="sendCmd('CELL_FWD')">TIẾN ĐÚNG 1 Ô (30cm)</button>
       <button class="btn-forward" onclick="sendCmd('FORWARD')">ĐI THẲNG LIÊN TỤC</button>
@@ -117,6 +242,14 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       <button class="btn-left180" onclick="sendCmd('TURN_LEFT_180')">QUAY ĐẦU 180° (NGÕ CỤT)</button>
       <button class="btn-reset" onclick="sendCmd('RESET_YAW')">RESET YAW & LOCKED = 0°</button>
       <button class="btn-stop" onclick="sendCmd('STOP')">STOP & CĂN CHỈNH GỐC</button>
+    </div>
+
+    <div class="map-card">
+      <div class="map-title">
+        <span>Bản đồ trực quan (1 ô = 30cm)</span>
+        <span id="mapStatus">Chưa lưu</span>
+      </div>
+      <canvas id="mapCanvas" width="286" height="286"></canvas>
     </div>
 
     <div class="panel">
@@ -130,7 +263,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
   <div id="pageArm" class="page">
     <button class="btn-special" onclick="runSpecialMode()">CHẾ ĐỘ ĐẶC BIỆT (S2: 180° [0.5s] -> 90° x3 LẦN)</button>
 
-    <!-- S1: Tay gắp chạy từ từ tới 90 độ hoặc 0 độ -->
     <div class="servo-card">
       <div class="servo-header"><span>S1 - Tay gắp (Chạy từ từ 90° / 0°)</span><span id="ang1">90°</span></div>
       <div class="servo-btns">
@@ -139,7 +271,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- Đồng bộ 2 servo hông (ngược chiều nhau để cùng đưa tới / thu về) -->
     <div class="servo-card">
       <div class="servo-header"><span>S2 + S3 Đồng bộ (Ngược dấu nhau)</span><span id="twinState">S2:90° | S3:90°</span></div>
       <div class="servo-btns">
@@ -148,7 +279,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- S2: Khớp Hông 1 -->
     <div class="servo-card">
       <div class="servo-header"><span>S2 - Khớp Hông 1 (SG90)</span><span id="ang2">90°</span></div>
       <div class="servo-btns">
@@ -167,7 +297,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- S3: Khớp Hông 2 -->
     <div class="servo-card">
       <div class="servo-header"><span>S3 - Khớp Hông 2 (SG90)</span><span id="ang3">90°</span></div>
       <div class="servo-btns">
@@ -186,7 +315,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- S4: Servo 360 độ -> Nhấn giữ quay chậm, nhả ra dừng (90) -->
     <div class="servo-card">
       <div class="servo-header"><span>S4 - Đế xoay 360° (Nhả = Dừng)</span><span id="ang4">DỪNG</span></div>
       <div class="servo-btns">
@@ -209,6 +337,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       document.getElementById('tabArmBtn').classList.toggle('active', tab === 'arm');
     }
 
+    function setMode(m) { fetch('/mode?m=' + m); }
     function sendCmd(cmd) { fetch('/cmd?action=' + cmd); }
 
     const servoAngles = { 1: 90, 2: 90, 3: 90 };
@@ -243,7 +372,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       fetch('/arm_twin?s2=' + a2 + '&s3=' + a3);
     }
 
-    // Tay gắp S1 chạy từ từ tới góc đích (90 hoặc 0)
     function sweepGripTo(targetAngle) {
       stopJog();
       stopTwinJog();
@@ -339,11 +467,77 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
       fetch('/scale?sx=' + sx + '&sy=' + sy).then(() => alert("Đã lưu Scale!"));
     }
 
+    function drawMap(gridArr, gx, gy, dir) {
+      const canvas = document.getElementById('mapCanvas');
+      const ctx = canvas.getContext('2d');
+      const N = 11;
+      const cellPx = 26;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          const px = x * cellPx;
+          const py = y * cellPx;
+          const val = gridArr[y * N + x] || 0;
+
+          // Ô xuất phát (5,5)
+          if (x === 5 && y === 5) {
+            ctx.fillStyle = '#e8f5e9';
+            ctx.fillRect(px, py, cellPx, cellPx);
+          }
+
+          // Cờ có hàng (bit 4 = 16)
+          if ((val & 16) !== 0) {
+            ctx.fillStyle = '#ffe082';
+            ctx.fillRect(px + 3, py + 3, cellPx - 6, cellPx - 6);
+            ctx.fillStyle = '#bf360c';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText('HÀNG', px + 3, py + 16);
+          }
+
+          // Lưới mờ
+          ctx.strokeStyle = '#e0e0e0';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(px, py, cellPx, cellPx);
+
+          // Tường đã đo (0: Bắc, 1: Đông, 2: Nam, 3: Tây)
+          ctx.strokeStyle = '#212121';
+          ctx.lineWidth = 2.5;
+          if (val & 1) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + cellPx, py); ctx.stroke(); }
+          if (val & 2) { ctx.beginPath(); ctx.moveTo(px + cellPx, py); ctx.lineTo(px + cellPx, py + cellPx); ctx.stroke(); }
+          if (val & 4) { ctx.beginPath(); ctx.moveTo(px, py + cellPx); ctx.lineTo(px + cellPx, py + cellPx); ctx.stroke(); }
+          if (val & 8) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, py + cellPx); ctx.stroke(); }
+        }
+      }
+
+      // Vẽ xe + hướng mũi tên
+      const cx = gx * cellPx + cellPx / 2;
+      const cy = gy * cellPx + cellPx / 2;
+      ctx.fillStyle = '#d32f2f';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+      ctx.fill();
+
+      let dx = 0, dy = 0;
+      if (dir === 0) dy = -10;
+      else if (dir === 1) dx = 10;
+      else if (dir === 2) dy = 10;
+      else if (dir === 3) dx = -10;
+      ctx.strokeStyle = '#ffeb3b';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + dx, cy + dy);
+      ctx.stroke();
+    }
+
     setInterval(function() {
       fetch('/getdata').then(res => res.json()).then(data => {
         document.getElementById("telemetryBox").innerHTML = 
-          "Yaw: " + data.yaw + "° | Lck: " + data.locked + "°<br>" + data.sensor;
-        if(data.log) document.getElementById("logBox").innerText = data.log;
+          "Mode: " + data.mode + " | Yaw: " + data.yaw + "° | Lck: " + data.locked + "°<br>" + data.sensor;
+        document.getElementById("mapStatus").innerText = data.saved ? "Đã lưu bản đồ" : "Đang cập nhật";
+        if (data.log) document.getElementById("logBox").innerText = data.log;
+        if (data.map) drawMap(data.map, data.gx, data.gy, data.dir);
       });
     }, 500);
   </script>
@@ -353,9 +547,41 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
 void handleRoot() { server.send(200, "text/html; charset=utf-8", MAIN_page); }
 
+void handleMode() {
+  if (server.hasArg("m")) {
+    int m = server.arg("m").toInt();
+    autoMode = constrain(m, 0, 2);
+    if (autoMode == 0) {
+      autoStep = AUTO_IDLE;
+      robotState = IDLE;
+      currentCommand = "STOP";
+      Serial2.println("CMD:S");
+      latestMapLog = "Đã dừng chế độ tự động.";
+    } else if (autoMode == 1) {
+      // Khởi động Chế độ 1: reset bản đồ & bắt đầu dò từ ô xuất phát (5,5)
+      memset(mapGrid, 0, sizeof(mapGrid));
+      robotGX = 5; robotGY = 5; robotDir = 0;
+      cellsMovedSinceStart = 0;
+      mapSaved = false;
+      autoStep = AUTO_SCAN_AND_DECIDE;
+      latestMapLog = "Bắt đầu Chế độ 1: Dò mê cung (1 ô = 30cm)...";
+    } else if (autoMode == 2) {
+      // Nút 2: Chế độ chuyển hàng (thử nghiệm)
+      autoStep = AUTO_CARGO_DEMO;
+      robotState = IDLE;
+      currentCommand = "CARGO_TEST";
+      latestMapLog = mapSaved ? "Chế độ 2 (Thử nghiệm): Đã tải bản đồ lưu, sẵn sàng đi tới ô gắn cờ HÀNG."
+                              : "Chế độ 2 (Thử nghiệm): Chưa có bản đồ lưu, chạy thử nghiệm trên lưới hiện tại.";
+    }
+    server.send(200, "text/plain", "OK");
+  }
+}
+
 void handleCmd() {
   if (server.hasArg("action")) {
     String action = server.arg("action");
+    autoMode = 0;
+    autoStep = AUTO_IDLE;
     currentCommand = action;
     if (action == "CELL_FWD") { Serial2.println("CMD:C"); robotState = CELL_FORWARD; latestMapLog = "Tiến đúng 1 ô (30cm)..."; }
     else if (action == "FORWARD") { Serial2.println("CMD:F"); robotState = STRAIGHT; latestMapLog = "Đi thẳng liên tục..."; }
@@ -425,27 +651,108 @@ void handleScale() {
   }
 }
 
-long readMasterUltrasonic() {
-  digitalWrite(US_TRIG, LOW); delayMicroseconds(2);
-  digitalWrite(US_TRIG, HIGH); delayMicroseconds(10);
-  digitalWrite(US_TRIG, LOW);
-  long duration = pulseIn(US_ECHO, HIGH, 20000);
-  if (duration == 0) return 999;
-  return duration * 0.034 / 2;
-}
-
 void handleGetData() {
-  String irStr = String(digitalRead(IR_1)) + String(digitalRead(IR_2)) + String(digitalRead(IR_3)) + String(digitalRead(IR_4)) + String(digitalRead(IR_5));
-  long cargoDist = readMasterUltrasonic();
-  String sensorInfo = "IR:" + irStr + " | US:" + cargoDist + "cm<br>" + workerEncoderData;
+  String sensorInfo = "US L:" + String(distLeft) + " F:" + String(distFront) + " R:" + String(distRight) +
+                      " | IRF:" + String(irFrontVal) + " IRS:" + String(irFloorVal) + "<br>" + workerEncoderData;
+
+  String mapArrJson = "[";
+  for (int y = 0; y < GRID_SIZE; y++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
+      mapArrJson += String(mapGrid[y][x]);
+      if (!(y == GRID_SIZE - 1 && x == GRID_SIZE - 1)) mapArrJson += ",";
+    }
+  }
+  mapArrJson += "]";
 
   String json = "{";
+  json += "\"mode\":" + String(autoMode) + ",";
+  json += "\"saved\":" + String(mapSaved ? "true" : "false") + ",";
   json += "\"yaw\":" + String(yawAngle, 1) + ",";
   json += "\"locked\":" + String(lockedHeading, 1) + ",";
+  json += "\"gx\":" + String(robotGX) + ",";
+  json += "\"gy\":" + String(robotGY) + ",";
+  json += "\"dir\":" + String(robotDir) + ",";
   json += "\"sensor\":\"" + sensorInfo + "\",";
-  json += "\"log\":\"" + latestMapLog + "\"";
+  json += "\"log\":\"" + latestMapLog + "\",";
+  json += "\"map\":" + mapArrJson;
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void runAutonomousMode1Step() {
+  unsigned long now = millis();
+
+  if (autoStep == AUTO_SCAN_AND_DECIDE) {
+    scanSensorsSequential();
+    markCurrentCellWalls();
+
+    // Kiểm tra quay về vạch xuất phát (vạch line ngang dưới sàn = IR_FLOOR 1 sau khi đã đi ít nhất 2 ô)
+    if (cellsMovedSinceStart >= 2 && irFloorVal == 1 && (now - lastStartLineTrigger > 2500)) {
+      lastStartLineTrigger = now;
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      currentCommand = "STOP";
+      autoMode = 0;
+      autoStep = AUTO_IDLE;
+      mapSaved = true;
+      latestMapLog = "Đã về vạch xuất phát (line ngang) & LƯU BẢN ĐỒ! Sẵn sàng Nút 2.";
+      return;
+    }
+
+    bool leftClear = (distLeft >= WALL_DIST_CM);
+    bool frontClear = (distFront >= WALL_DIST_CM);
+    bool rightClear = (distRight >= WALL_DIST_CM);
+
+    // Thuật toán dò mê cung ưu tiên: Trái -> Thẳng -> Phải -> Lùi nhẹ rồi Quay đầu 180°
+    if (leftClear) {
+      pendingTurnDelta = 90;
+      pendingReverseBeforeTurn = false;
+      startTurnToTarget(lockedHeading + 90.0, "Dò: Trái trống -> Quay trái 90°");
+      autoStep = AUTO_WAIT_TURN;
+    } else if (frontClear) {
+      startOneCellForward();
+      autoStep = AUTO_WAIT_CELL_FWD;
+    } else if (rightClear) {
+      pendingTurnDelta = -90;
+      pendingReverseBeforeTurn = false;
+      startTurnToTarget(lockedHeading - 90.0, "Dò: Phải trống -> Quay phải 90°");
+      autoStep = AUTO_WAIT_TURN;
+    } else {
+      // Có vật cản/ngõ cụt phía trước: lùi nhẹ 1 tẹo rồi mới quay xe 180°
+      pendingTurnDelta = 180;
+      pendingReverseBeforeTurn = true;
+      Serial2.println("CMD:R");
+      currentCommand = "REV_微";
+      stepTimeoutAt = now + 260;
+      autoStep = AUTO_WAIT_REVERSE;
+      latestMapLog = "Thấy vật cản/ngõ cụt -> Lùi nhẹ rồi quay đầu 180°...";
+    }
+  }
+  else if (autoStep == AUTO_WAIT_REVERSE) {
+    if (now >= stepTimeoutAt) {
+      Serial2.println("CMD:S");
+      startTurnToTarget(lockedHeading + pendingTurnDelta, "Đã lùi nhẹ -> Đang quay 180°...");
+      autoStep = AUTO_WAIT_TURN;
+    }
+  }
+  else if (autoStep == AUTO_WAIT_TURN) {
+    if (robotState == IDLE) {
+      updateRobotDirFromTurn(pendingTurnDelta);
+      startOneCellForward();
+      autoStep = AUTO_WAIT_CELL_FWD;
+    }
+  }
+  else if (autoStep == AUTO_WAIT_CELL_FWD) {
+    if (robotState == IDLE) {
+      advanceGridPosition();
+      autoStep = AUTO_SCAN_AND_DECIDE;
+    } else if (now > stepTimeoutAt) {
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      advanceGridPosition();
+      autoStep = AUTO_SCAN_AND_DECIDE;
+    }
+  }
 }
 
 void setup() {
@@ -456,9 +763,14 @@ void setup() {
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
 
-  pinMode(IR_1, INPUT_PULLUP); pinMode(IR_2, INPUT_PULLUP); 
-  pinMode(IR_3, INPUT_PULLUP); pinMode(IR_4, INPUT_PULLUP); pinMode(IR_5, INPUT_PULLUP);
-  pinMode(US_TRIG, OUTPUT); pinMode(US_ECHO, INPUT);
+  pinMode(US_FRONT_TRIG, OUTPUT); pinMode(US_FRONT_ECHO, INPUT);
+  pinMode(US_LEFT_TRIG, OUTPUT);  pinMode(US_LEFT_ECHO, INPUT);
+  pinMode(US_RIGHT_TRIG, OUTPUT); pinMode(US_RIGHT_ECHO, INPUT);
+
+  pinMode(IR_FRONT, INPUT_PULLUP);
+  pinMode(IR_FLOOR, INPUT_PULLUP);
+
+  memset(mapGrid, 0, sizeof(mapGrid));
 
   delay(500);
   double sum = 0.0;
@@ -475,6 +787,7 @@ void setup() {
 
   WiFi.softAP(ssid, password);
   server.on("/", handleRoot);
+  server.on("/mode", handleMode);
   server.on("/cmd", handleCmd);
   server.on("/arm_single", handleArmSingle);
   server.on("/arm_twin", handleArmTwin);
@@ -500,26 +813,35 @@ void loop() {
     yawAngle += gz_deg * dt;
   }
 
+  if (autoMode == 1) {
+    runAutonomousMode1Step();
+  }
+
   if (robotState == STRAIGHT || robotState == CELL_FORWARD) {
     float headingError = yawAngle - lockedHeading;
     lastCorrectionVal = (int)(headingError * 2);
     Serial2.println("CORRECTION:" + String(lastCorrectionVal));
   } else if (robotState == TURNING) {
     float error = targetYaw - yawAngle;
-    if (abs(error) <= 0.8) {
-      Serial2.println("CMD:S"); robotState = IDLE; currentCommand = "STOP";
-      lockedHeading = targetYaw; latestMapLog = "Quay xong, Locked=" + String(lockedHeading, 1) + "°";
+    if (abs(error) <= 1.2) {
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      currentCommand = "STOP";
+      lockedHeading = targetYaw;
+      latestMapLog = "Quay xong, Locked=" + String(lockedHeading, 1) + "°";
     } else {
-      int turnPower = constrain(abs(error) * 2.5, 50, 90);
+      int turnPower = constrain(abs(error) * 2.5, 65, 130);
       Serial2.println(error > 0 ? "TURNC:L," + String(turnPower) : "TURNC:R," + String(turnPower));
     }
   } else if (robotState == ALIGN_BEFORE_STOP) {
     float error = lockedHeading - yawAngle;
-    if (abs(error) <= 0.8) {
-      Serial2.println("CMD:S"); robotState = IDLE; currentCommand = "STOP";
+    if (abs(error) <= 1.2) {
+      Serial2.println("CMD:S");
+      robotState = IDLE;
+      currentCommand = "STOP";
       latestMapLog = "Đã căn chuẩn hướng gốc!";
     } else {
-      Serial2.println(error > 0 ? "TURNC:L,55" : "TURNC:R,55");
+      Serial2.println(error > 0 ? "TURNC:L,70" : "TURNC:R,70");
     }
   }
 
@@ -527,11 +849,21 @@ void loop() {
     String incoming = Serial2.readStringUntil('\n'); incoming.trim();
     if (incoming.startsWith("LOG:")) latestMapLog = incoming.substring(4);
     else if (incoming.startsWith("ENC:")) workerEncoderData = incoming.substring(4);
+    else if (incoming == "CELL_DONE") {
+      if (robotState == CELL_FORWARD) {
+        robotState = IDLE;
+        currentCommand = "STOP";
+      }
+    }
   }
 
   display.clearDisplay(); display.setCursor(0, 0);
-  display.print("Yaw:"); display.print(yawAngle, 1); display.print(" Lck:"); display.println(lockedHeading, 1);
-  display.print("US:"); display.print(readMasterUltrasonic()); display.print("cm "); display.println(currentCommand);
+  display.print("M:"); display.print(autoMode);
+  display.print(" Y:"); display.print(yawAngle, 0);
+  display.print(" L:"); display.println(lockedHeading, 0);
+  display.print("F:"); display.print(distFront);
+  display.print(" IRF:"); display.print(irFrontVal);
+  display.print(" IRS:"); display.println(irFloorVal);
   display.display();
   delay(15);
 }
